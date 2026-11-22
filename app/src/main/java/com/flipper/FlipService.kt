@@ -35,9 +35,11 @@ import java.util.concurrent.Executors
  *     行为与原生一致，请求经 dumpsys mCurrentAppOrientation 可见（声明值不被掩盖）；
  *   - user_rotation 写 0/1/2/3 任意角，显示精确跟手（多次实验全中）。
  *
- * 于是引擎 = 唯一权威，声明靠"探测"显形（fixed=enabled 会把 mCurrentAppOrientation
- * 掩盖成解析值，实测）：平时 fixed=enabled 独占显示权；栈顶应用切换 / 状态栏显隐变化
- * 时，fixed 暂还 default 一拍（150ms）读真实声明 → 决策写 user_rotation → 立刻压回。
+ * 于是引擎 = 唯一权威，声明直接读：`dumpsys activity activities` 里栈顶 Activity 的
+ * requestedOrientation 不被 fixed=enabled 掩盖（实测），轮询即得，无需释放 fixed。
+ * （旧方案是"探测"：fixed 暂还 default 一拍让 mCurrentAppOrientation 显形——探测
+ * 窗口内 accel=1 + fixed=default，原生旋转裸奔，完全绕过防抖，表现为每次启动应用
+ * 时连续翻转 2-4 轮、间隔远小于 2 秒，已废弃。）
  *   探测读到横族声明（全屏视频等）→ 横轴跟手（90/270）；竖族/UNSPECIFIED → 竖轴（0/180）；
  *   锁屏永远竖轴；应用退出即回竖轴（≤一个轮询周期）。
  * 决策唯一入口 apply()：目标角变了才写一条 user_rotation，无震荡源。
@@ -67,6 +69,10 @@ class FlipService : Service() {
     @Volatile
     private var target = -1
 
+    /** 防抖窗口内挂起的旋转决定；-1 = 无挂起。窗口期满才提交到 target。 */
+    @Volatile
+    private var pendingDesired = -1
+
     /** 当前执行通道是否 root：root 模式下 dumpsys 轮询降频（每次都是独立 su 进程）。 */
     @Volatile
     private var rootMode = false
@@ -84,13 +90,9 @@ class FlipService : Service() {
     @Volatile
     private var lastModeKey = ""
 
-    /** 栈顶应用（"包/Activity"）：变化 = 应用切换 → 触发探测。 */
+    /** 栈顶应用（"包/Activity"）：变化 = 应用切换 → 决策。 */
     @Volatile
     private var topActivity = ""
-
-    /** 探测在途：fixed 暂还 default 读真实声明的窗口期。 */
-    @Volatile
-    private var probeInFlight = false
 
     private val prefs by lazy { getSharedPreferences("flipper", Context.MODE_PRIVATE) }
 
@@ -213,15 +215,6 @@ class FlipService : Service() {
             return
         }
 
-        val baseAuto = runGetInt("system", "accelerometer_rotation", -1)
-        val baseUser = runGetInt("system", "user_rotation", -1)
-        val baseFixed = fixedToken()
-        prefs.edit()
-            .putInt(KEY_BASE_AUTO, baseAuto)
-            .putInt(KEY_BASE_USER, baseUser)
-            .putString(KEY_BASE_FIXED, baseFixed)
-            .apply()
-
         // 翻转模式种子归竖轴；旋转模式保留四向种子
         val rawSeed = currentRotation()
         val seed = if (flipOn() && (rawSeed == Surface.ROTATION_90 || rawSeed == Surface.ROTATION_270)) {
@@ -229,17 +222,31 @@ class FlipService : Service() {
         } else {
             rawSeed
         }
+        // 一次调用完成"读快照 → 落笔"：快照值在同一 shell 里先 echo 回传（落笔前的
+        // 真实底座），三条接管命令紧随其后。此前是 3 读 + 1 写共 4 次独立权限进程，
+        // 接管窗口好几秒——窗口内系统原生旋转照转（防抖还没接管）；合并后亚秒级。
+        // 命令顺序：先写种子（= 当前显示角，无视觉跳变）再上 fixed，杜绝中间态。
         val result = Exec.run(
             this,
             listOf(
-                "settings put system accelerometer_rotation 1",
-                "wm fixed-to-user-rotation enabled",
-                "settings put system user_rotation " + seed,
+                "echo A=\$(settings get system accelerometer_rotation);" +
+                    "echo U=\$(settings get system user_rotation);" +
+                    "echo F=\$(wm fixed-to-user-rotation);" +
+                    "settings put system user_rotation " + seed + ";" +
+                    "wm fixed-to-user-rotation enabled;" +
+                    "settings put system accelerometer_rotation 1",
             ),
         )
         rootMode = result.via == Exec.Mode.ROOT
         EngineState.via = result.via.name.lowercase()
         Log.i(TAG, "engage ok=" + result.ok + " via=" + result.via + " seed=" + seed)
+
+        // 快照是落笔前在同一 shell 内读出的，落笔后持久化（还原用）
+        prefs.edit()
+            .putInt(KEY_BASE_AUTO, echoInt(result.message, "A"))
+            .putInt(KEY_BASE_USER, echoInt(result.message, "U"))
+            .putString(KEY_BASE_FIXED, echoToken(result.message, "F"))
+            .apply()
 
         // 一次性校验：三条命令都读回确认（仅 engage 做，不是逐次写校验，无震荡源）
         val verified = result.ok && verifyEngaged(seed)
@@ -268,20 +275,32 @@ class FlipService : Service() {
         notifyTip(tip())
     }
 
-    /** 接管校验：读回三项，确认权威真正建立。 */
+    /** 接管校验：一次调用读回三项，确认权威真正建立。 */
     private fun verifyEngaged(seed: Int): Boolean {
-        val accel = runGetInt("system", "accelerometer_rotation", -1)
-        val user = runGetInt("system", "user_rotation", -1)
-        val fixed = fixedToken()
+        val out = Exec.run(
+            this,
+            listOf(
+                "echo A=\$(settings get system accelerometer_rotation);" +
+                    "echo U=\$(settings get system user_rotation);" +
+                    "echo F=\$(wm fixed-to-user-rotation)",
+            ),
+        ).message
+        val accel = echoInt(out, "A")
+        val user = echoInt(out, "U")
+        val fixed = echoToken(out, "F")
         EngineState.accel = accel
         EngineState.fixed = fixed
         return accel == 1 && user == seed && fixed == "enabled"
     }
 
-    private fun fixedToken(): String =
-        Exec.run(this, listOf("wm fixed-to-user-rotation")).message.lineSequence()
-            .map { it.trim() }
-            .lastOrNull { it == "default" || it == "enabled" || it == "disabled" } ?: "?"
+    /** 从合并 shell 调用的 echo 标记输出取整数值（"null"/缺标记 → -1，与 runGetInt 语义一致）。 */
+    private fun echoInt(message: String, tag: String): Int =
+        Regex("(?m)^" + tag + "=(\\S+)").find(message)?.groupValues?.get(1)
+            ?.takeIf { it != "null" }?.toIntOrNull() ?: -1
+
+    /** 同上，取 token（fixed 状态 default/enabled/disabled）。 */
+    private fun echoToken(message: String, tag: String): String =
+        Regex("(?m)^" + tag + "=(\\S+)").find(message)?.groupValues?.get(1) ?: "?"
 
     private fun scheduleEngageRetry() {
         main.removeCallbacks(engageRetry)
@@ -338,6 +357,8 @@ class FlipService : Service() {
 
     private fun stopPieces() {
         main.removeCallbacks(engageRetry)
+        main.removeCallbacks(debounceWrite)
+        pendingDesired = -1
         tiltSensor?.unregister()
         runCatching { contentResolver.unregisterContentObserver(systemStateObserver) }
         runCatching { unregisterReceiver(screenReceiver) }
@@ -373,12 +394,34 @@ class FlipService : Service() {
         return desired
     }
 
+    /** 防抖落笔：2 秒窗口内堆积的旋转决定只认最后一次——窗口内来了新决定就重置
+     *  计时，窗口静默期满才真正写一条 user_rotation。窗口内决定又回到已提交角，
+     *  直接撤销挂起（连写都不用写）。 */
     private fun writeTarget(desired: Int, reason: String) {
-        if (desired == target) return
+        if (desired == target) {
+            if (pendingDesired >= 0) {
+                main.removeCallbacks(debounceWrite)
+                pendingDesired = -1
+                EngineState.lastEvent = "debounce cancel(" + reason + ")"
+            }
+            return
+        }
+        if (desired == pendingDesired) return // 同一决定已挂起，计时器不动（防饿死）
+        pendingDesired = desired
+        EngineState.lastEvent = reason + " (debounce 2s)"
+        Log.i(TAG, "apply(" + reason + ") pending -> " + desired)
+        main.removeCallbacks(debounceWrite)
+        main.postDelayed(debounceWrite, WRITE_DEBOUNCE_MS)
+    }
+
+    /** 防抖期满：执行最后一次决定，此刻才更新已提交角。 */
+    private val debounceWrite = Runnable {
+        val desired = pendingDesired
+        pendingDesired = -1
+        if (desired < 0 || desired == target) return@Runnable
         target = desired
         EngineState.target = desired
-        EngineState.lastEvent = reason
-        Log.i(TAG, "apply(" + reason + ") -> " + desired)
+        Log.i(TAG, "debounced write -> " + desired)
         worker.execute {
             Exec.run(this@FlipService, listOf("settings put system user_rotation " + desired))
         }
@@ -444,86 +487,38 @@ class FlipService : Service() {
         }
     }
 
-    /** 前台方向轮询：fixed=enabled 会把 mCurrentAppOrientation 掩盖成解析值（实测），
-     *  平时读不到应用的真实声明。所以这里只盯两个"变化信号"——栈顶应用切换、
-     *  状态栏显隐（全屏沉浸旁证）——任一变化就触发一次探测，让声明显形后决策。
-     *  两份 dumpsys 都不便宜：隔拍轮流读，轮询在途防积压。 */
+    /** 前台方向轮询：直接读栈顶 Activity 自己声明的 requestedOrientation——该字段不被
+     *  fixed=enabled 掩盖（实测），无需释放 fixed 探测，显示全程钉死在 user_rotation。
+     *  Display #0 从栈顶往下列，dump 里第一个 requestedOrientation 就是栈顶声明。
+     *  栈顶应用切换或声明变化 → 决策。 */
     private fun pollOrientation() {
-        if (pollInFlight || probeInFlight) return
+        if (pollInFlight) return
         pollInFlight = true
         worker.execute {
             try {
-                val useActivity = tickCount % 2 == 0L
                 val out = Exec.run(
                     this@FlipService,
-                    listOf(if (useActivity) "dumpsys activity activities" else "dumpsys window"),
+                    listOf("dumpsys activity activities"),
                 ).message
-                val top = if (useActivity) {
-                    Regex("topResumedActivity=ActivityRecord\\{\\w+ u0 ([^ }]+)").find(out)
-                        ?.groupValues?.getOrNull(1).orEmpty()
-                } else {
-                    topActivity
-                }
-                val sb = if (useActivity) {
-                    null
-                } else {
-                    Regex("type=statusBars[^\\n]*?visible=(true|false)").find(out)
-                        ?.groupValues?.getOrNull(1)
-                }
+                val top = Regex("topResumedActivity=ActivityRecord\\{\\w+ u0 ([^ }]+)").find(out)
+                    ?.groupValues?.getOrNull(1).orEmpty()
+                val orient = Regex("requestedOrientation=SCREEN_ORIENTATION_(\\w+)").find(out)
+                    ?.groupValues?.getOrNull(1).orEmpty()
                 main.post {
-                    var trigger = false
+                    var changed = false
                     if (top.isNotEmpty() && top != topActivity) {
                         topActivity = top
-                        trigger = true
+                        changed = true
                     }
-                    if (sb != null) {
-                        val visible = sb == "true"
-                        if (visible != EngineState.statusBar) {
-                            EngineState.statusBar = visible
-                            trigger = true
-                        }
+                    if (orient.isNotEmpty() && orient != appOrientation) {
+                        appOrientation = orient
+                        EngineState.appOrientation = orient
+                        changed = true
                     }
-                    if (trigger) probe()
+                    if (changed) apply("orient=" + appOrientation)
                 }
             } finally {
                 pollInFlight = false
-            }
-        }
-    }
-
-    /** 探测：fixed 暂还 default 一拍，被掩盖的 mCurrentAppOrientation 显形（应用真实
-     *  声明），读到后立即决策并重新压上 fixed。探测窗口内显示朝目标方向先动一拍，
-     *  属预期（探测的触发源本身就是要处理的事件）。中途被杀：fixed 残留 default，
-     *  下次 engage 的 stale 清理兜底。 */
-    private fun probe() {
-        if (keyguardLocked || probeInFlight) return
-        probeInFlight = true
-        prefs.edit().putBoolean(KEY_FIXED_ON, false).apply()
-        worker.execute {
-            try {
-                Exec.run(this@FlipService, listOf("wm fixed-to-user-rotation default"))
-                Thread.sleep(150)
-                val out = Exec.run(this@FlipService, listOf("dumpsys window")).message
-                val orient = Regex("mCurrentAppOrientation=SCREEN_ORIENTATION_(\\w+)").find(out)
-                    ?.groupValues?.getOrNull(1).orEmpty()
-                main.post {
-                    if (orient.isNotEmpty()) {
-                        EngineState.appOrientation = orient
-                        if (orient != appOrientation) {
-                            appOrientation = orient
-                            apply("probe=" + orient)
-                        } else {
-                            apply("probe")
-                        }
-                    }
-                }
-                Exec.run(this@FlipService, listOf("wm fixed-to-user-rotation enabled"))
-                prefs.edit().putBoolean(KEY_FIXED_ON, true).apply()
-            } catch (e: InterruptedException) {
-                runCatching { Exec.run(this@FlipService, listOf("wm fixed-to-user-rotation enabled")) }
-                prefs.edit().putBoolean(KEY_FIXED_ON, true).apply()
-            } finally {
-                probeInFlight = false
             }
         }
     }
@@ -622,6 +617,7 @@ class FlipService : Service() {
         private const val CHANNEL_ID = "flip"
         private const val NOTIFICATION_ID = 1
         private const val TICK_INTERVAL_MS = 300L
+        private const val WRITE_DEBOUNCE_MS = 2000L
         private const val ENGAGE_RETRY_MS = 3000L
         private const val REASSERT_MS = 1500L
         private const val WATCHDOG_INTERVAL_MS = 15L * 60 * 1000
@@ -637,7 +633,6 @@ class FlipService : Service() {
         const val KEY_BASE_AUTO = "base_auto"
         const val KEY_BASE_USER = "base_user"
         const val KEY_BASE_FIXED = "base_fixed"
-        const val KEY_FIXED_ON = "fixed_on"
 
         fun wanted(context: Context): Boolean {
             val prefs = context.getSharedPreferences("flipper", Context.MODE_PRIVATE)
@@ -656,7 +651,6 @@ object EngineState {
     @Volatile var tilt: Int = -1
     @Volatile var appOrientation: String = ""
     @Volatile var keyguard: Boolean = false
-    @Volatile var statusBar: Boolean = true
     @Volatile var lastEvent: String = ""
     @Volatile var lastError: String = ""
 }

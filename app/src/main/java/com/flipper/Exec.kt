@@ -187,10 +187,13 @@ object Exec {
         val connection = Connection()
         val component = ComponentName(context.packageName, UserService::class.java.name)
         val args = Shizuku.UserServiceArgs(component)
-            .daemon(false)
+            // 守护模式：shell 进程跨应用重启存活，冷启动免去 2~3 秒的 app_process 拉起——
+            // 这段拉起时间正是"打开开关后原生旋转裸奔"窗口的大头。
+            .daemon(true)
             .processNameSuffix("shell")
             .debuggable(false)
-            .version(2)
+            // UserService 代码变更时递增，逼 Shizuku 杀掉旧代码的守护进程换新的
+            .version(3)
         return try {
             Shizuku.bindUserService(args, connection)
             val bound = connection.latch.await(BIND_TIMEOUT_SECONDS, TimeUnit.SECONDS)
