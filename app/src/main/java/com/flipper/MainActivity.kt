@@ -199,40 +199,20 @@ class MainActivity : ComponentActivity() {
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {
-                Text("flipper", fontSize = 28.sp)
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "权限通道：Shizuku 优先，Root 回退\n方向权威一次性接管，无校验对抗",
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(40.dp))
-
-                ToggleRow("翻转", "竖屏 0°/180° 自动 · 前台要横屏时切 90°/270°", flipOn) { onFlip(it) }
+                ToggleRow("翻转", "自动翻转", flipOn) { onFlip(it) }
                 Spacer(Modifier.height(20.dp))
-                ToggleRow("旋转", "代替系统旋转开关 · 强制四向", rotateOn) { onRotate(it) }
-
-                Spacer(Modifier.height(32.dp))
-                Text(statusText, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.height(8.dp))
-                Text(diagText, fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
-                Spacer(Modifier.height(32.dp))
+                ToggleRow("旋转", "自动旋转", rotateOn) { onRotate(it) }
+                Spacer(Modifier.height(20.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onClick = { requestIgnoreBatteryOptimizations() }) {
-                        Text("电池白名单", fontSize = 13.sp)
+                        Text("加入电池白名单", fontSize = 13.sp)
                     }
                     if (Build.VERSION.SDK_INT >= 31) {
                         TextButton(onClick = { requestExactAlarm() }) {
-                            Text("允许精确闹钟", fontSize = 13.sp)
+                            Text("允许闹钟精度", fontSize = 13.sp)
                         }
                     }
                 }
-                Text(
-                    "保活：前台服务 + 开机自启 + 任务划掉自动恢复 + 15 分钟看门狗。" +
-                        "深度定制系统（vivo 等）请再到系统管家里允许「自启动」与「后台高耗电」",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.outline,
-                )
             }
         }
     }
