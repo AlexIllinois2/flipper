@@ -73,6 +73,10 @@ class FlipService : Service() {
     @Volatile
     private var pendingDesired = -1
 
+    /** 本次接管是否已有防抖落笔：false = 启动期（用启动防抖），true = 运行期（用运行防抖）。 */
+    @Volatile
+    private var committedOnce = false
+
     /** 当前执行通道是否 root：root 模式下 dumpsys 轮询降频（每次都是独立 su 进程）。 */
     @Volatile
     private var rootMode = false
@@ -267,6 +271,7 @@ class FlipService : Service() {
 
         EngineState.lastError = ""
         EngineState.engaged = true
+        committedOnce = false
         target = seed
         EngineState.target = seed
         lastModeKey = (if (flipOn()) "F" else "") + (if (rotateOn()) "R" else "")
@@ -394,9 +399,10 @@ class FlipService : Service() {
         return desired
     }
 
-    /** 防抖落笔：2 秒窗口内堆积的旋转决定只认最后一次——窗口内来了新决定就重置
+    /** 防抖落笔：窗口内堆积的旋转决定只认最后一次——窗口内来了新决定就重置
      *  计时，窗口静默期满才真正写一条 user_rotation。窗口内决定又回到已提交角，
-     *  直接撤销挂起（连写都不用写）。 */
+     *  直接撤销挂起（连写都不用写）。窗口长短分两档：启动期（本次接管还没有过
+     *  落笔）用启动防抖，之后运行期用运行防抖；间隔均由主界面配置。 */
     private fun writeTarget(desired: Int, reason: String) {
         if (desired == target) {
             if (pendingDesired >= 0) {
@@ -408,10 +414,11 @@ class FlipService : Service() {
         }
         if (desired == pendingDesired) return // 同一决定已挂起，计时器不动（防饿死）
         pendingDesired = desired
-        EngineState.lastEvent = reason + " (debounce 2s)"
+        val interval = if (committedOnce) runningDebounceMs() else startupDebounceMs()
+        EngineState.lastEvent = reason + " (debounce " + interval + "ms)"
         Log.i(TAG, "apply(" + reason + ") pending -> " + desired)
         main.removeCallbacks(debounceWrite)
-        main.postDelayed(debounceWrite, WRITE_DEBOUNCE_MS)
+        main.postDelayed(debounceWrite, interval)
     }
 
     /** 防抖期满：执行最后一次决定，此刻才更新已提交角。 */
@@ -421,6 +428,7 @@ class FlipService : Service() {
         if (desired < 0 || desired == target) return@Runnable
         target = desired
         EngineState.target = desired
+        committedOnce = true
         Log.i(TAG, "debounced write -> " + desired)
         worker.execute {
             Exec.run(this@FlipService, listOf("settings put system user_rotation " + desired))
@@ -529,6 +537,13 @@ class FlipService : Service() {
     private fun flipOn(): Boolean = prefs.getBoolean(KEY_FLIP_ON, false)
     private fun wanted(): Boolean = rotateOn() || flipOn()
 
+    /** 防抖间隔（主界面可配，改完即生效，下次落笔取新值）。 */
+    private fun startupDebounceMs(): Long =
+        prefs.getLong(KEY_DEBOUNCE_STARTUP, DEFAULT_DEBOUNCE_STARTUP_MS)
+
+    private fun runningDebounceMs(): Long =
+        prefs.getLong(KEY_DEBOUNCE_RUNNING, DEFAULT_DEBOUNCE_RUNNING_MS)
+
     private fun keyguardLocked(): Boolean =
         getSystemService(KeyguardManager::class.java)?.isKeyguardLocked ?: false
 
@@ -617,7 +632,6 @@ class FlipService : Service() {
         private const val CHANNEL_ID = "flip"
         private const val NOTIFICATION_ID = 1
         private const val TICK_INTERVAL_MS = 300L
-        private const val WRITE_DEBOUNCE_MS = 2000L
         private const val ENGAGE_RETRY_MS = 3000L
         private const val REASSERT_MS = 1500L
         private const val WATCHDOG_INTERVAL_MS = 15L * 60 * 1000
@@ -633,6 +647,10 @@ class FlipService : Service() {
         const val KEY_BASE_AUTO = "base_auto"
         const val KEY_BASE_USER = "base_user"
         const val KEY_BASE_FIXED = "base_fixed"
+        const val KEY_DEBOUNCE_STARTUP = "debounce_startup_ms"
+        const val KEY_DEBOUNCE_RUNNING = "debounce_running_ms"
+        const val DEFAULT_DEBOUNCE_STARTUP_MS = 2000L
+        const val DEFAULT_DEBOUNCE_RUNNING_MS = 500L
 
         fun wanted(context: Context): Boolean {
             val prefs = context.getSharedPreferences("flipper", Context.MODE_PRIVATE)

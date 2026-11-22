@@ -11,14 +11,17 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -32,6 +35,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
@@ -51,6 +55,12 @@ class MainActivity : ComponentActivity() {
 
     private var flipOn by mutableStateOf(false)
     private var rotateOn by mutableStateOf(false)
+    private var startupDebounce by mutableStateOf(
+        FlipService.DEFAULT_DEBOUNCE_STARTUP_MS.toString(),
+    )
+    private var runningDebounce by mutableStateOf(
+        FlipService.DEFAULT_DEBOUNCE_RUNNING_MS.toString(),
+    )
     private var statusText by mutableStateOf("检查权限通道…")
     private var diagText by mutableStateOf("")
 
@@ -117,6 +127,19 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences("flipper", MODE_PRIVATE)
         flipOn = prefs.getBoolean(FlipService.KEY_FLIP_ON, false)
         rotateOn = prefs.getBoolean(FlipService.KEY_ROTATE_ON, false)
+        startupDebounce = prefs
+            .getLong(FlipService.KEY_DEBOUNCE_STARTUP, FlipService.DEFAULT_DEBOUNCE_STARTUP_MS)
+            .toString()
+        runningDebounce = prefs
+            .getLong(FlipService.KEY_DEBOUNCE_RUNNING, FlipService.DEFAULT_DEBOUNCE_RUNNING_MS)
+            .toString()
+    }
+
+    /** 防抖输入：合法（0~10000ms）即落 pref，服务下次落笔自动取新值；非法只改文本。 */
+    private fun onDebounce(key: String, text: String) {
+        text.toLongOrNull()?.takeIf { it in 0..10000 }?.let { ms ->
+            prefs().edit().putLong(key, ms).apply()
+        }
     }
 
     private fun wanted(): Boolean = flipOn || rotateOn
@@ -212,6 +235,16 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.height(20.dp))
                 ToggleRow("旋转", "自动旋转", rotateOn) { onRotate(it) }
                 Spacer(Modifier.height(20.dp))
+                DebounceField("启动防抖 (ms)", "服务接管后首次翻转前生效", startupDebounce) {
+                    startupDebounce = it
+                    onDebounce(FlipService.KEY_DEBOUNCE_STARTUP, it)
+                }
+                Spacer(Modifier.height(12.dp))
+                DebounceField("运行防抖 (ms)", "首次翻转后生效", runningDebounce) {
+                    runningDebounce = it
+                    onDebounce(FlipService.KEY_DEBOUNCE_RUNNING, it)
+                }
+                Spacer(Modifier.height(20.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onClick = { requestIgnoreBatteryOptimizations() }) {
                         Text("加入电池白名单", fontSize = 13.sp)
@@ -239,6 +272,20 @@ class MainActivity : ComponentActivity() {
         } else {
             "未接管（开关全关）"
         }
+    }
+
+    /** 防抖间隔输入框：数字键盘，单行，随输入持久化。 */
+    @Composable
+    private fun DebounceField(label: String, desc: String, value: String, onChange: (String) -> Unit) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onChange,
+            singleLine = true,
+            label = { Text(label, fontSize = 13.sp) },
+            supportingText = { Text(desc, fontSize = 10.sp) },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 
     @Composable
